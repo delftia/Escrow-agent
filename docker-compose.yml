@@ -1,0 +1,70 @@
+
+services:
+  # ─── Main app ────────────────────────────────────────────────────────────────
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ton-mcp:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://trustdeal:trustdeal@postgres:5432/trustdeal
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - '3000:3000'
+
+  # ─── @ton/mcp agentic wallet server ─────────────────────────────────────────
+  # This process holds the private key and signs all TON transactions.
+  # The main app communicates with it via HTTP on port 3001.
+  ton-mcp:
+    image: node:20-alpine
+    restart: unless-stopped
+    command: >
+      sh -c "npm install -g @ton/mcp@alpha 2>/dev/null;
+             npx @ton/mcp@alpha --http 3001"
+    ports:
+      - '3001:3001'
+    environment:
+      MNEMONIC: ${MNEMONIC}
+      WALLET_VERSION: ${WALLET_VERSION:-agentic}
+      AGENTIC_WALLET_ADDRESS: ${AGENTIC_WALLET_ADDRESS}
+      NETWORK: ${TON_NETWORK:-testnet}
+      TONCENTER_API_KEY: ${TONCENTER_API_KEY:-}
+
+  # ─── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trustdeal
+      POSTGRES_PASSWORD: trustdeal
+      POSTGRES_DB: trustdeal
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U trustdeal']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,127 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DealStatus {
+  DRAFT
+  NEGOTIATING
+  AWAITING_PAYMENT
+  ACTIVE
+  UNDER_REVIEW
+  DISPUTED
+  COMPLETED
+  PARTIALLY_RESOLVED
+  REFUNDED
+  CANCELED
+}
+
+enum PaymentType {
+  LOCK
+  RELEASE
+  REFUND
+  PARTIAL_RELEASE
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+}
+
+enum MessageRole {
+  CREATOR
+  EXECUTOR
+  ARBITRATOR
+  SYSTEM
+}
+
+model User {
+  id            BigInt   @id
+  username      String?
+  firstName     String?
+  walletAddress String?
+  rating        Float    @default(0)
+  dealsCount    Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  dealsAsCreator  Deal[]    @relation("DealCreator")
+  dealsAsExecutor Deal[]    @relation("DealExecutor")
+  openedDisputes  Dispute[] @relation("DisputeOpener")
+
+  @@map("users")
+}
+
+model Deal {
+  id             String     @id @default(uuid())
+  creatorId      BigInt
+  executorId     BigInt?
+  status         DealStatus @default(DRAFT)
+  amountTon      Float
+  contractJson   Json?
+  rawDescription String
+  deadlineAt     DateTime?
+  completedAt    DateTime?
+  inviteToken    String     @unique @default(uuid())
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  creator  User  @relation("DealCreator", fields: [creatorId], references: [id])
+  executor User? @relation("DealExecutor", fields: [executorId], references: [id])
+
+  payments PaymentIntent[]
+  messages DealMessage[]
+  dispute  Dispute?
+
+  @@map("deals")
+}
+
+model PaymentIntent {
+  id          String        @id @default(uuid())
+  dealId      String
+  txHash      String?
+  amountTon   Float
+  type        PaymentType
+  status      PaymentStatus @default(PENDING)
+  confirmedAt DateTime?
+  createdAt   DateTime      @default(now())
+
+  deal Deal @relation(fields: [dealId], references: [id])
+
+  @@map("payment_intents")
+}
+
+model DealMessage {
+  id          String      @id @default(uuid())
+  dealId      String
+  role        MessageRole
+  content     String
+  attachments Json?
+  createdAt   DateTime    @default(now())
+
+  deal Deal @relation(fields: [dealId], references: [id])
+
+  @@map("deal_messages")
+}
+
+model Dispute {
+  id                   String    @id @default(uuid())
+  dealId               String    @unique
+  openedBy             BigInt
+  creatorEvidence      Json?
+  executorEvidence     Json?
+  verdictJson          Json?
+  executorSharePercent Int?
+  resolvedAt           DateTime?
+  createdAt            DateTime  @default(now())
+
+  deal         Deal @relation(fields: [dealId], references: [id])
+  openedByUser User @relation("DisputeOpener", fields: [openedBy], references: [id])
+
+  @@map("disputes")
+}

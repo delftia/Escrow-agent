@@ -1,0 +1,683 @@
+import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { InlineKeyboard } from 'grammy';
+import { BotService } from './bot.service';
+import { BotContext } from './bot.types';
+import { UserService } from '../user/user.service';
+import { DealService } from '../deal/deal.service';
+import { IntentService } from '../intent/intent.service';
+import { ContractService } from '../contract/contract.service';
+import { PaymentService } from '../payment/payment.service';
+import { DisputeService } from '../dispute/dispute.service';
+import { ArbitrationService } from '../arbitration/arbitration.service';
+import { QueueService } from '../queue/queue.service';
+import { PrismaService } from '../../database/prisma.service';
+import dayjs from 'dayjs';
+
+@Injectable()
+export class BotUpdate implements OnModuleInit {
+  private readonly logger = new Logger(BotUpdate.name);
+
+  constructor(
+    private readonly bot: BotService,
+    private readonly users: UserService,
+    private readonly deals: DealService,
+    private readonly intent: IntentService,
+    private readonly contract: ContractService,
+    private readonly payment: PaymentService,
+    private readonly dispute: DisputeService,
+    private readonly arbitration: ArbitrationService,
+    private readonly queue: QueueService,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  // ─── Inline notification helpers (replaces NotificationService) ─────────────
+
+  private async notify(userId: bigint, text: string, keyboard?: InlineKeyboard): Promise<void> {
+    try {
+      await this.bot.bot.api.sendMessage(Number(userId), text, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+    } catch (err) {
+      this.logger.warn(`Cannot notify ${userId}: ${err?.message}`);
+    }
+  }
+
+  private async notifyExecutorConfirmed(dealId: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal) return;
+    await this.notify(
+      deal.creatorId,
+      `🎯 *Executor accepted your deal!*\n\nDeal \`${dealId.slice(0, 8)}\` is ready.\nLock *${deal.amountTon} TON* in escrow to start the work.`,
+      new InlineKeyboard().text(`💎 Pay ${deal.amountTon} TON`, `pay:${dealId}`),
+    );
+  }
+
+  private async notifyPaymentConfirmed(dealId: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal?.executorId) return;
+    const deadline = deal.deadlineAt ? dayjs(deal.deadlineAt).format('DD MMM YYYY, HH:mm') : 'Not set';
+    await this.notify(
+      deal.executorId,
+      `💎 *Funds locked in escrow!*\n\nDeal \`${dealId.slice(0, 8)}\` is now active.\n*${deal.amountTon} TON* secured.\nDeadline: *${deadline}*`,
+      new InlineKeyboard().text('📤 Submit Result', `submit:${dealId}`),
+    );
+    await this.notify(deal.creatorId, `✅ *Payment confirmed!*\n\nYour *${deal.amountTon} TON* is locked in escrow.\nDeadline: *${deadline}*`);
+  }
+
+  private async notifyResultSubmitted(dealId: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal) return;
+    await this.notify(
+      deal.creatorId,
+      `📦 *Work submitted!*\n\nThe executor submitted their result for deal \`${dealId.slice(0, 8)}\`.\nPlease review and confirm or open a dispute.\n_You have 24 hours before auto-release._`,
+      new InlineKeyboard()
+        .text('✅ Confirm & Release', `complete:${dealId}`).row()
+        .text('⚖️ Open Dispute', `dispute:${dealId}`),
+    );
+  }
+
+  private async notifyDealCompleted(dealId: string, txHash: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal?.executorId) return;
+    await this.notify(deal.executorId, `🎉 *Payment released!*\n\n*${deal.amountTon} TON* sent to your wallet.\nTX: \`${txHash.slice(0, 20)}...\``);
+    await this.notify(deal.creatorId, `✅ *Deal completed!*\n\nThank you for using TrustDeal.`);
+  }
+
+  private async notifyVerdictIssued(dealId: string, verdictText: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal?.executorId) return;
+    await this.notify(deal.creatorId, verdictText);
+    await this.notify(deal.executorId, verdictText);
+  }
+
+  onModuleInit() {
+    const { bot } = this.bot;
+
+    // ─── /start ─────────────────────────────────────────────────────────────
+
+    bot.command('start', async (ctx) => {
+      const userId = BigInt(ctx.from!.id);
+      await this.users.upsert({
+        id: userId,
+        username: ctx.from!.username,
+        firstName: ctx.from!.first_name,
+      });
+
+      // Handle invite links: /start invite_TOKEN
+      const payload = ctx.match as string;
+      if (payload?.startsWith('invite_')) {
+        const token = payload.replace('invite_', '');
+        await this.handleInvite(ctx, token);
+        return;
+      }
+
+      await ctx.reply(
+        `👋 Welcome to *TrustDeal*\n\n` +
+          `Safe deals between two people using TON escrow and AI arbitration.\n\n` +
+          `*How it works:*\n` +
+          `1️⃣ Describe your deal in plain text\n` +
+          `2️⃣ AI structures the contract\n` +
+          `3️⃣ TON locks the funds in escrow\n` +
+          `4️⃣ AI arbitrates any disputes automatically`,
+        { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
+      );
+    });
+
+    // ─── Menu callbacks ──────────────────────────────────────────────────────
+
+    bot.callbackQuery('menu:new_deal', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      ctx.session.step = 'awaiting_description';
+      ctx.session.draftDeal = {};
+      await ctx.reply(
+        `📝 *Create a new deal*\n\n` +
+          `Describe your deal in plain text. For example:\n\n` +
+          `_"I want to order a logo design for 50 TON, deadline 3 days. ` +
+          `I need 3 concepts in PNG and SVG format."_\n\n` +
+          `Just write naturally — I'll handle the rest.`,
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    bot.callbackQuery('menu:my_deals', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await this.showMyDeals(ctx);
+    });
+
+    bot.callbackQuery('menu:wallet', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await this.showWallet(ctx);
+    });
+
+    bot.callbackQuery('menu:help', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        `❓ *How TrustDeal works*\n\n` +
+          `*Creating a deal:*\n` +
+          `Write what you need in plain text. The AI agent will ask clarifying questions ` +
+          `and build a structured contract with deliverables and acceptance criteria.\n\n` +
+          `*Escrow:*\n` +
+          `After both parties agree, the client pays TON into escrow. ` +
+          `Funds are locked in an agentic wallet until the deal is resolved.\n\n` +
+          `*Completing a deal:*\n` +
+          `The executor submits their result. The client confirms — funds are released instantly.\n\n` +
+          `*Disputes:*\n` +
+          `If there's a disagreement, an AI arbitrator analyzes both sides' evidence ` +
+          `against the original contract and issues a fair verdict. ` +
+          `Funds are split automatically.\n\n` +
+          `*Fee:* 1% of deal amount\n\n` +
+          `_Note: funds are held in a centralized escrow wallet. ` +
+          `Smart contract escrow coming in V2._`,
+        { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
+      );
+    });
+
+    // ─── Deal view ───────────────────────────────────────────────────────────
+
+    bot.callbackQuery(/^view:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      await this.showDeal(ctx, dealId);
+    });
+
+    // ─── Contract confirm ────────────────────────────────────────────────────
+
+    bot.callbackQuery('contract:confirm', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const userId = BigInt(ctx.from!.id);
+      const draft = ctx.session.draftDeal;
+
+      if (!draft.contractJson || !draft.amountTon) {
+        await ctx.reply('Something went wrong. Please start over.', {
+          reply_markup: this.bot.mainMenu(),
+        });
+        return;
+      }
+
+      const deal = await this.deals.create({
+        creatorId: userId,
+        rawDescription: draft.rawDescription!,
+        contractJson: draft.contractJson,
+        amountTon: draft.amountTon,
+        deadlineHours: draft.deadlineHours ?? 72,
+      });
+
+      ctx.session.step = 'idle';
+      ctx.session.draftDeal = {};
+
+      const botUsername = ctx.me.username;
+      const inviteLink = `https://t.me/${botUsername}?start=invite_${deal.inviteToken}`;
+
+      await ctx.reply(
+        `✅ *Deal created!*\n\n` +
+          `Share this link with the person who will do the work:\n\n` +
+          `${inviteLink}\n\n` +
+          `Once they accept, you'll be asked to lock the funds.`,
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    bot.callbackQuery('contract:edit', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      ctx.session.step = 'awaiting_description';
+      ctx.session.draftDeal = {};
+      await ctx.reply('OK, let\'s start over. Describe the deal again:');
+    });
+
+    bot.callbackQuery('contract:cancel', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      ctx.session.step = 'idle';
+      ctx.session.draftDeal = {};
+      await ctx.reply('Cancelled.', { reply_markup: this.bot.mainMenu() });
+    });
+
+    // ─── Executor confirms deal via invite ───────────────────────────────────
+
+    bot.callbackQuery(/^accept:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      const userId = BigInt(ctx.from!.id);
+
+      try {
+        await this.deals.confirmExecutor(dealId, userId);
+
+        // Register executor if not in DB
+        await this.users.upsert({
+          id: userId,
+          username: ctx.from!.username,
+          firstName: ctx.from!.first_name,
+        });
+
+        await ctx.reply(
+          `✅ *You accepted the deal!*\n\n` +
+            `The client has been notified and will now lock the funds.\n` +
+            `You'll receive a notification when the money is in escrow.`,
+          { parse_mode: 'Markdown' },
+        );
+
+        // Notify creator
+        await this.notifyExecutorConfirmed(dealId);
+      } catch (err) {
+        await ctx.reply(`❌ ${err.message}`);
+      }
+    });
+
+    bot.callbackQuery(/^decline:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await ctx.reply('You declined the deal.');
+    });
+
+    // ─── Payment ─────────────────────────────────────────────────────────────
+
+    bot.callbackQuery(/^pay:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      const userId = BigInt(ctx.from!.id);
+      await this.handlePayment(ctx, dealId, userId);
+    });
+
+    // User clicks "I paid" after sending TON
+    bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+
+      const statusMsg = await ctx.reply(
+        `⏳ *Checking payment...*\n\n` +
+          `I'm monitoring the blockchain. You'll be notified once confirmed.\n` +
+          `This usually takes 10–60 seconds.`,
+        { parse_mode: 'Markdown' },
+      );
+
+      // Poll blockchain directly (up to 2 minutes)
+      let confirmed = false;
+      for (let i = 0; i < 8; i++) {
+        await new Promise((r) => setTimeout(r, 15_000));
+        confirmed = await this.payment.verifyPayment(dealId);
+        if (confirmed) break;
+      }
+
+      await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id).catch(() => {});
+
+      if (confirmed) {
+        await this.deals.markPaid(dealId);
+        await this.notifyPaymentConfirmed(dealId);
+        await ctx.reply(`✅ *Payment confirmed!* Funds are locked in escrow.`, {
+          parse_mode: 'Markdown',
+        });
+      } else {
+        // Schedule background queue as fallback
+        await this.queue.schedulePaymentVerification(dealId);
+        await ctx.reply(
+          `⏳ Transaction not found yet.\n\nI'll keep checking in the background and notify you when confirmed.`,
+          { parse_mode: 'Markdown' },
+        );
+      }
+    });
+
+    // ─── Submit result ───────────────────────────────────────────────────────
+
+    bot.callbackQuery(/^submit:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      const userId = BigInt(ctx.from!.id);
+
+      try {
+        await this.deals.submitResult(dealId, userId);
+        await this.notifyResultSubmitted(dealId);
+        await ctx.reply(
+          `📤 *Result submitted!*\n\n` +
+            `The client has been notified. They have 24 hours to confirm or open a dispute.`,
+          { parse_mode: 'Markdown' },
+        );
+      } catch (err) {
+        await ctx.reply(`❌ ${err.message}`);
+      }
+    });
+
+    // ─── Complete deal (creator confirms) ───────────────────────────────────
+
+    bot.callbackQuery(/^complete:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      const userId = BigInt(ctx.from!.id);
+
+      try {
+        await this.deals.complete(dealId, userId);
+
+        const loadingMsg = await ctx.reply('💸 Releasing payment...');
+
+        const txHash = await this.payment.releaseToExecutor(dealId);
+        await this.notifyDealCompleted(dealId, txHash);
+
+        await ctx.api.deleteMessage(ctx.chat!.id, loadingMsg.message_id).catch(() => {});
+        await ctx.reply(
+          `🎉 *Deal completed!*\n\n` +
+            `Payment released to the executor.\n` +
+            `TX: \`${txHash.slice(0, 20)}...\``,
+          { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
+        );
+      } catch (err) {
+        await ctx.reply(`❌ ${err.message}`);
+      }
+    });
+
+    // ─── Dispute ─────────────────────────────────────────────────────────────
+
+    bot.callbackQuery(/^dispute:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const dealId = ctx.match[1];
+      const userId = BigInt(ctx.from!.id);
+
+      await this.dispute.open(dealId, userId);
+
+      ctx.session.step = 'awaiting_dispute_evidence';
+      ctx.session.activeDealId = dealId;
+
+      await ctx.reply(
+        `⚖️ *Dispute opened*\n\n` +
+          `Please describe:\n` +
+          `• What exactly was NOT delivered\n` +
+          `• How it differs from the agreed contract\n\n` +
+          `Be as specific as possible. The AI arbitrator will use this as evidence.`,
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    // ─── Wallet ──────────────────────────────────────────────────────────────
+
+    bot.callbackQuery('wallet:set', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        `Please send your TON wallet address (starts with EQ or UQ):`,
+      );
+      ctx.session.step = 'idle'; // handled in text handler below
+    });
+
+    // ─── Text messages ───────────────────────────────────────────────────────
+
+    bot.on('message:text', async (ctx) => {
+      const text = ctx.message.text;
+      const { step } = ctx.session;
+
+      // Check if user is setting wallet address
+      if ((text.startsWith('EQ') || text.startsWith('UQ')) && text.length > 40) {
+        await this.users.updateWallet(BigInt(ctx.from!.id), text.trim());
+        await ctx.reply(`✅ Wallet saved: \`${text.trim()}\``, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      if (step === 'awaiting_description') {
+        await this.handleDescription(ctx, text);
+        return;
+      }
+
+      if (step === 'awaiting_clarification') {
+        await this.handleClarification(ctx, text);
+        return;
+      }
+
+      if (step === 'awaiting_dispute_evidence') {
+        await this.handleDisputeEvidence(ctx, text);
+        return;
+      }
+
+      // Default
+      await ctx.reply(
+        `Use the menu to get started:`,
+        { reply_markup: this.bot.mainMenu() },
+      );
+    });
+  }
+
+  // ─── Private handlers ─────────────────────────────────────────────────────
+
+  private async handleDescription(ctx: BotContext, text: string) {
+    const loading = await ctx.reply('🤔 Analyzing your request...');
+
+    const result = await this.intent.parse(text);
+
+    ctx.session.draftDeal = {
+      rawDescription: text,
+      enrichedText: text,
+      contractJson: result.contract,
+      amountTon: result.amountTon,
+      deadlineHours: result.deadlineHours,
+    };
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    if (result.missingInfo.length > 0) {
+      ctx.session.step = 'awaiting_clarification';
+      ctx.session.draftDeal.pendingQuestion = result.missingInfo[0];
+      await ctx.reply(
+        `I need one more detail:\n\n*${result.missingInfo[0]}*`,
+        { parse_mode: 'Markdown' },
+      );
+    } else {
+      await this.showContractPreview(ctx);
+    }
+  }
+
+  private async handleClarification(ctx: BotContext, answer: string) {
+    const draft = ctx.session.draftDeal;
+    // Append Q+A to enriched text
+    const enriched = `${draft.enrichedText}\n${draft.pendingQuestion}: ${answer}`;
+    ctx.session.draftDeal.enrichedText = enriched;
+
+    const loading = await ctx.reply('✏️ Updating contract...');
+    const result = await this.intent.parse(enriched);
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    ctx.session.draftDeal.contractJson = result.contract;
+    ctx.session.draftDeal.amountTon = result.amountTon;
+    ctx.session.draftDeal.deadlineHours = result.deadlineHours;
+
+    if (result.missingInfo.length > 0) {
+      ctx.session.draftDeal.pendingQuestion = result.missingInfo[0];
+      await ctx.reply(
+        `One more thing:\n\n*${result.missingInfo[0]}*`,
+        { parse_mode: 'Markdown' },
+      );
+    } else {
+      ctx.session.step = 'idle';
+      await this.showContractPreview(ctx);
+    }
+  }
+
+  private async showContractPreview(ctx: BotContext) {
+    const draft = ctx.session.draftDeal;
+    const preview = this.contract.formatPreview(
+      draft.contractJson!,
+      draft.amountTon!,
+      draft.deadlineHours ?? 72,
+    );
+
+    const keyboard = new InlineKeyboard()
+      .text('✅ Confirm & Create', 'contract:confirm').row()
+      .text('✏️ Start over', 'contract:edit').row()
+      .text('❌ Cancel', 'contract:cancel');
+
+    await ctx.reply(`${preview}\n\n_Confirm to create the deal and get a share link._`, {
+      parse_mode: 'Markdown',
+      reply_markup: keyboard,
+    });
+  }
+
+  private async handleInvite(ctx: BotContext, token: string) {
+    const deal = await this.deals.findByInviteToken(token);
+
+    if (!deal) {
+      await ctx.reply('❌ This invite link is invalid or has expired.');
+      return;
+    }
+
+    if (deal.status !== 'NEGOTIATING') {
+      await ctx.reply('⚠️ This deal already has an executor or is no longer available.');
+      return;
+    }
+
+    const c = deal.contractJson as Record<string, any>;
+    const deliverables = (c?.deliverables as string[])?.map((d) => `  • ${d}`).join('\n') ?? '  • —';
+
+    await ctx.reply(
+      `🤝 *You've been invited to a deal*\n\n` +
+        `*Service:* ${c?.serviceType}\n` +
+        `*Amount you'll receive:* ${deal.amountTon} TON\n\n` +
+        `*Your deliverables:*\n${deliverables}\n\n` +
+        `Do you accept these terms?`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: new InlineKeyboard()
+          .text('✅ Accept', `accept:${deal.id}`).row()
+          .text('❌ Decline', `decline:${deal.id}`),
+      },
+    );
+  }
+
+  private async handlePayment(ctx: BotContext, dealId: string, userId: bigint) {
+    const user = await this.users.findById(userId);
+
+    if (!user?.walletAddress) {
+      await ctx.reply(
+        `👛 *Wallet required*\n\n` +
+          `To pay, I need your TON wallet address to send refunds if needed.\n\n` +
+          `Please send your wallet address (starts with EQ or UQ):`,
+        { parse_mode: 'Markdown' },
+      );
+      return;
+    }
+
+    const deal = await this.deals.findById(dealId);
+    if (!deal) return;
+
+    const links = await this.payment.createPaymentIntent(dealId);
+
+    await ctx.reply(
+      `💎 *Payment required*\n\n` +
+        `Amount: *${deal.amountTon} TON*\n\n` +
+        `Send exactly *${deal.amountTon} TON* to the escrow wallet.\n` +
+        `Use one of the links below to open your wallet with pre-filled details:\n\n` +
+        `After sending, tap *"I paid"* and I'll confirm on the blockchain.`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: new InlineKeyboard()
+          .url('Open in Tonkeeper', links.tonkeeperLink).row()
+          .url('Open in TON Wallet', links.tonLink).row()
+          .text('✅ I paid', `paid:${dealId}`),
+      },
+    );
+  }
+
+  private async handleDisputeEvidence(ctx: BotContext, text: string) {
+    const dealId = ctx.session.activeDealId;
+    if (!dealId) return;
+
+    const userId = BigInt(ctx.from!.id);
+
+    const result = await this.dispute.submitEvidence(dealId, userId, text);
+    ctx.session.step = 'idle';
+
+    if (result === 'arbitrating') {
+      const loading = await ctx.reply(
+        `📋 Evidence received. Both sides have submitted — running AI arbitration now...`,
+      );
+
+      // Give arbitration a moment to run (it was triggered by setImmediate)
+      setTimeout(async () => {
+        const d = await this.dispute.findByDealId(dealId);
+        if (d?.verdictJson) {
+          const deal = await this.deals.findById(dealId);
+          const verdict = d.verdictJson as any;
+          const verdictText = this.arbitration.formatVerdict(verdict, deal!.amountTon);
+          await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+          await this.notifyVerdictIssued(dealId, verdictText);
+        }
+      }, 15_000);
+    } else {
+      await ctx.reply(
+        `📋 Evidence received.\n\nWaiting for the other party to submit their evidence.\n` +
+          `The AI arbitrator will issue a verdict once both sides respond, ` +
+          `or automatically after 24 hours.`,
+      );
+    }
+  }
+
+  private async showMyDeals(ctx: BotContext) {
+    const userId = BigInt(ctx.from!.id);
+    const dealList = await this.deals.findByUser(userId);
+
+    if (!dealList.length) {
+      await ctx.reply(
+        `You have no deals yet.`,
+        { reply_markup: new InlineKeyboard().text('➕ Create Deal', 'menu:new_deal') },
+      );
+      return;
+    }
+
+    let text = `📋 *Your deals:*\n\n`;
+    const keyboard = new InlineKeyboard();
+
+    for (const deal of dealList.slice(0, 8)) {
+      const emoji = this.bot.statusEmoji(deal.status);
+      const role = deal.creatorId === userId ? 'client' : 'executor';
+      text += `${emoji} \`${deal.id.slice(0, 8)}\` · ${deal.amountTon} TON · ${role}\n`;
+      keyboard.text(`${emoji} ${deal.id.slice(0, 8)}`, `view:${deal.id}`).row();
+    }
+
+    keyboard.text('➕ New Deal', 'menu:new_deal');
+    await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+  }
+
+  private async showDeal(ctx: BotContext, dealId: string) {
+    const userId = BigInt(ctx.from!.id);
+    const deal = await this.deals.findById(dealId);
+    if (!deal) { await ctx.reply('Deal not found.'); return; }
+
+    const role = deal.creatorId === userId ? 'creator' : 'executor';
+    const emoji = this.bot.statusEmoji(deal.status);
+    const c = deal.contractJson as Record<string, any>;
+
+    let text =
+      `${emoji} *Deal \`${dealId.slice(0, 8)}\`*\n\n` +
+      `Status: *${deal.status}*\n` +
+      `Amount: *${deal.amountTon} TON*\n` +
+      `Your role: *${role}*\n`;
+
+    if (deal.deadlineAt) {
+      text += `Deadline: *${new Date(deal.deadlineAt).toLocaleDateString()}*\n`;
+    }
+    if (c?.serviceType) {
+      text += `\nService: ${c.serviceType}`;
+    }
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      reply_markup: this.bot.dealActions(dealId, role, deal.status),
+    });
+  }
+
+  private async showWallet(ctx: BotContext) {
+    const userId = BigInt(ctx.from!.id);
+    const user = await this.users.findById(userId);
+
+    if (!user?.walletAddress) {
+      await ctx.reply(
+        `👛 *No wallet connected*\n\n` +
+          `Send your TON wallet address (starts with EQ or UQ) to connect it.\n\n` +
+          `Your wallet is needed for refunds and payments.`,
+        { parse_mode: 'Markdown' },
+      );
+    } else {
+      await ctx.reply(
+        `👛 *Your wallet*\n\n` +
+          `\`${user.walletAddress}\`\n\n` +
+          `Deals completed: ${user.dealsCount}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: new InlineKeyboard().text('🔄 Change wallet', 'wallet:set'),
+        },
+      );
+    }
+  }
+}
