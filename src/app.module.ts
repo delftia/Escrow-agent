@@ -36,8 +36,8 @@ import { NotificationModule } from './modules/notification/notification.module';
     ArbitrationModule,
     DisputeModule,
     QueueModule,
-    BotModule,
-    NotificationModule,
+    BotModule,          // BotModule before NotificationModule
+    NotificationModule, // NotificationModule imports BotModule
   ],
 })
 export class AppModule {}

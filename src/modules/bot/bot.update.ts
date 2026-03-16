@@ -9,9 +9,8 @@ import { ContractService } from '../contract/contract.service';
 import { PaymentService } from '../payment/payment.service';
 import { DisputeService } from '../dispute/dispute.service';
 import { ArbitrationService } from '../arbitration/arbitration.service';
+import { NotificationService } from '../notification/notification.service';
 import { QueueService } from '../queue/queue.service';
-import { PrismaService } from '../../database/prisma.service';
-import dayjs from 'dayjs';
 
 @Injectable()
 export class BotUpdate implements OnModuleInit {
@@ -26,70 +25,9 @@ export class BotUpdate implements OnModuleInit {
     private readonly payment: PaymentService,
     private readonly dispute: DisputeService,
     private readonly arbitration: ArbitrationService,
+    private readonly notifications: NotificationService,
     private readonly queue: QueueService,
-    private readonly prisma: PrismaService,
   ) {}
-
-  // ─── Inline notification helpers (replaces NotificationService) ─────────────
-
-  private async notify(userId: bigint, text: string, keyboard?: InlineKeyboard): Promise<void> {
-    try {
-      await this.bot.bot.api.sendMessage(Number(userId), text, {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard,
-      });
-    } catch (err) {
-      this.logger.warn(`Cannot notify ${userId}: ${err?.message}`);
-    }
-  }
-
-  private async notifyExecutorConfirmed(dealId: string): Promise<void> {
-    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
-    if (!deal) return;
-    await this.notify(
-      deal.creatorId,
-      `🎯 *Executor accepted your deal!*\n\nDeal \`${dealId.slice(0, 8)}\` is ready.\nLock *${deal.amountTon} TON* in escrow to start the work.`,
-      new InlineKeyboard().text(`💎 Pay ${deal.amountTon} TON`, `pay:${dealId}`),
-    );
-  }
-
-  private async notifyPaymentConfirmed(dealId: string): Promise<void> {
-    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
-    if (!deal?.executorId) return;
-    const deadline = deal.deadlineAt ? dayjs(deal.deadlineAt).format('DD MMM YYYY, HH:mm') : 'Not set';
-    await this.notify(
-      deal.executorId,
-      `💎 *Funds locked in escrow!*\n\nDeal \`${dealId.slice(0, 8)}\` is now active.\n*${deal.amountTon} TON* secured.\nDeadline: *${deadline}*`,
-      new InlineKeyboard().text('📤 Submit Result', `submit:${dealId}`),
-    );
-    await this.notify(deal.creatorId, `✅ *Payment confirmed!*\n\nYour *${deal.amountTon} TON* is locked in escrow.\nDeadline: *${deadline}*`);
-  }
-
-  private async notifyResultSubmitted(dealId: string): Promise<void> {
-    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
-    if (!deal) return;
-    await this.notify(
-      deal.creatorId,
-      `📦 *Work submitted!*\n\nThe executor submitted their result for deal \`${dealId.slice(0, 8)}\`.\nPlease review and confirm or open a dispute.\n_You have 24 hours before auto-release._`,
-      new InlineKeyboard()
-        .text('✅ Confirm & Release', `complete:${dealId}`).row()
-        .text('⚖️ Open Dispute', `dispute:${dealId}`),
-    );
-  }
-
-  private async notifyDealCompleted(dealId: string, txHash: string): Promise<void> {
-    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
-    if (!deal?.executorId) return;
-    await this.notify(deal.executorId, `🎉 *Payment released!*\n\n*${deal.amountTon} TON* sent to your wallet.\nTX: \`${txHash.slice(0, 20)}...\``);
-    await this.notify(deal.creatorId, `✅ *Deal completed!*\n\nThank you for using TrustDeal.`);
-  }
-
-  private async notifyVerdictIssued(dealId: string, verdictText: string): Promise<void> {
-    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
-    if (!deal?.executorId) return;
-    await this.notify(deal.creatorId, verdictText);
-    await this.notify(deal.executorId, verdictText);
-  }
 
   onModuleInit() {
     const { bot } = this.bot;
@@ -257,7 +195,7 @@ export class BotUpdate implements OnModuleInit {
         );
 
         // Notify creator
-        await this.notifyExecutorConfirmed(dealId);
+        await this.notifications.onExecutorConfirmed(dealId);
       } catch (err) {
         await ctx.reply(`❌ ${err.message}`);
       }
@@ -282,37 +220,15 @@ export class BotUpdate implements OnModuleInit {
       await ctx.answerCallbackQuery();
       const dealId = ctx.match[1];
 
-      const statusMsg = await ctx.reply(
+      await ctx.reply(
         `⏳ *Checking payment...*\n\n` +
-          `I'm monitoring the blockchain. You'll be notified once confirmed.\n` +
-          `This usually takes 10–60 seconds.`,
+          `I'm monitoring the blockchain. You'll be notified once the transaction is confirmed.\n` +
+          `This usually takes 10–30 seconds.`,
         { parse_mode: 'Markdown' },
       );
 
-      // Poll blockchain directly (up to 2 minutes)
-      let confirmed = false;
-      for (let i = 0; i < 8; i++) {
-        await new Promise((r) => setTimeout(r, 15_000));
-        confirmed = await this.payment.verifyPayment(dealId);
-        if (confirmed) break;
-      }
-
-      await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id).catch(() => {});
-
-      if (confirmed) {
-        await this.deals.markPaid(dealId);
-        await this.notifyPaymentConfirmed(dealId);
-        await ctx.reply(`✅ *Payment confirmed!* Funds are locked in escrow.`, {
-          parse_mode: 'Markdown',
-        });
-      } else {
-        // Schedule background queue as fallback
-        await this.queue.schedulePaymentVerification(dealId);
-        await ctx.reply(
-          `⏳ Transaction not found yet.\n\nI'll keep checking in the background and notify you when confirmed.`,
-          { parse_mode: 'Markdown' },
-        );
-      }
+      // Start polling queue
+      await this.queue.schedulePaymentVerification(dealId);
     });
 
     // ─── Submit result ───────────────────────────────────────────────────────
@@ -324,7 +240,7 @@ export class BotUpdate implements OnModuleInit {
 
       try {
         await this.deals.submitResult(dealId, userId);
-        await this.notifyResultSubmitted(dealId);
+        await this.notifications.onResultSubmitted(dealId);
         await ctx.reply(
           `📤 *Result submitted!*\n\n` +
             `The client has been notified. They have 24 hours to confirm or open a dispute.`,
@@ -348,7 +264,7 @@ export class BotUpdate implements OnModuleInit {
         const loadingMsg = await ctx.reply('💸 Releasing payment...');
 
         const txHash = await this.payment.releaseToExecutor(dealId);
-        await this.notifyDealCompleted(dealId, txHash);
+        await this.notifications.onDealCompleted(dealId, txHash);
 
         await ctx.api.deleteMessage(ctx.chat!.id, loadingMsg.message_id).catch(() => {});
         await ctx.reply(
@@ -591,7 +507,7 @@ export class BotUpdate implements OnModuleInit {
           const verdict = d.verdictJson as any;
           const verdictText = this.arbitration.formatVerdict(verdict, deal!.amountTon);
           await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-          await this.notifyVerdictIssued(dealId, verdictText);
+          await this.notifications.onVerdictIssued(dealId, verdictText);
         }
       }, 15_000);
     } else {

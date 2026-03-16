@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { BotService } from './bot.service';
 import { BotUpdate } from './bot.update';
 import { UserModule } from '../user/user.module';
@@ -9,6 +9,7 @@ import { PaymentModule } from '../payment/payment.module';
 import { DisputeModule } from '../dispute/dispute.module';
 import { ArbitrationModule } from '../arbitration/arbitration.module';
 import { QueueModule } from '../queue/queue.module';
+import { NotificationModule } from '../notification/notification.module';
 
 @Module({
   imports: [
@@ -19,7 +20,8 @@ import { QueueModule } from '../queue/queue.module';
     PaymentModule,
     ArbitrationModule,
     DisputeModule,
-    QueueModule,
+    forwardRef(() => QueueModule),
+    forwardRef(() => NotificationModule),
   ],
   providers: [BotService, BotUpdate],
   exports: [BotService],
