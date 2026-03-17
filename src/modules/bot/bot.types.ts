@@ -11,10 +11,11 @@ export interface DraftDeal {
 
 export interface SessionData {
   step:
-    | 'idle'
-    | 'awaiting_description'
-    | 'awaiting_clarification'
-    | 'awaiting_dispute_evidence';
+  | 'idle'
+  | 'awaiting_description'
+  | 'awaiting_clarification'
+  | 'awaiting_dispute_evidence'
+  | 'awaiting_wallet';
   draftDeal: DraftDeal;
   activeDealId?: string;
 }

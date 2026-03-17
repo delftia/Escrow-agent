@@ -22,7 +22,19 @@ export class BotService implements OnModuleInit {
       }),
     );
 
-    // Start polling
+    this.bot.catch(async (err) => {
+      const ctx = err.ctx;
+      this.logger.error(`Bot middleware error while handling update ${ctx.update.update_id}`, err.error);
+    
+      try {
+        if (ctx.chat?.id) {
+          await ctx.reply('❌ Something went wrong. Please try again.');
+        }
+      } catch (replyErr) {
+        this.logger.warn('Failed to send fallback error message', replyErr);
+      }
+    });
+
     this.bot.start({
       onStart: (info) => this.logger.log(`Bot @${info.username} started`),
     }).catch((err) => this.logger.error('Bot start error', err));

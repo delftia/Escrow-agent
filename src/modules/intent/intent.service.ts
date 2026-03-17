@@ -51,6 +51,7 @@ export class IntentService {
       const response = await this.openai.chat.completions.create({
         model: process.env.OPENAI_MODEL ?? 'gpt-4o',
         temperature: 0.2,
+        response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userText },
@@ -58,7 +59,14 @@ export class IntentService {
       });
 
       const raw = response.choices[0]?.message?.content ?? '{}';
-      const parsed = JSON.parse(raw);
+
+      const cleaned = raw
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/, '')
+        .trim();
+      
+      const parsed = JSON.parse(cleaned);
 
       return {
         contract: parsed.contract ?? {

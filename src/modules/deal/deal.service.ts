@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service';
 import { DealStatus } from '@prisma/client';
-import dayjs from 'dayjs';
+import dayjs = require('dayjs');
 
 export interface CreateDealDto {
   creatorId: bigint;

@@ -65,7 +65,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Menu callbacks ──────────────────────────────────────────────────────
 
     bot.callbackQuery('menu:new_deal', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       ctx.session.step = 'awaiting_description';
       ctx.session.draftDeal = {};
       await ctx.reply(
@@ -79,17 +79,17 @@ export class BotUpdate implements OnModuleInit {
     });
 
     bot.callbackQuery('menu:my_deals', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       await this.showMyDeals(ctx);
     });
 
     bot.callbackQuery('menu:wallet', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       await this.showWallet(ctx);
     });
 
     bot.callbackQuery('menu:help', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       await ctx.reply(
         `❓ *How TrustDeal works*\n\n` +
           `*Creating a deal:*\n` +
@@ -114,7 +114,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Deal view ───────────────────────────────────────────────────────────
 
     bot.callbackQuery(/^view:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       await this.showDeal(ctx, dealId);
     });
@@ -122,7 +122,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Contract confirm ────────────────────────────────────────────────────
 
     bot.callbackQuery('contract:confirm', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const userId = BigInt(ctx.from!.id);
       const draft = ctx.session.draftDeal;
 
@@ -157,14 +157,14 @@ export class BotUpdate implements OnModuleInit {
     });
 
     bot.callbackQuery('contract:edit', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       ctx.session.step = 'awaiting_description';
       ctx.session.draftDeal = {};
       await ctx.reply('OK, let\'s start over. Describe the deal again:');
     });
 
     bot.callbackQuery('contract:cancel', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       ctx.session.step = 'idle';
       ctx.session.draftDeal = {};
       await ctx.reply('Cancelled.', { reply_markup: this.bot.mainMenu() });
@@ -173,7 +173,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Executor confirms deal via invite ───────────────────────────────────
 
     bot.callbackQuery(/^accept:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       const userId = BigInt(ctx.from!.id);
 
@@ -202,14 +202,14 @@ export class BotUpdate implements OnModuleInit {
     });
 
     bot.callbackQuery(/^decline:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       await ctx.reply('You declined the deal.');
     });
 
     // ─── Payment ─────────────────────────────────────────────────────────────
 
     bot.callbackQuery(/^pay:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       const userId = BigInt(ctx.from!.id);
       await this.handlePayment(ctx, dealId, userId);
@@ -217,7 +217,7 @@ export class BotUpdate implements OnModuleInit {
 
     // User clicks "I paid" after sending TON
     bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
 
       await ctx.reply(
@@ -234,7 +234,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Submit result ───────────────────────────────────────────────────────
 
     bot.callbackQuery(/^submit:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       const userId = BigInt(ctx.from!.id);
 
@@ -254,7 +254,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Complete deal (creator confirms) ───────────────────────────────────
 
     bot.callbackQuery(/^complete:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       const userId = BigInt(ctx.from!.id);
 
@@ -281,7 +281,7 @@ export class BotUpdate implements OnModuleInit {
     // ─── Dispute ─────────────────────────────────────────────────────────────
 
     bot.callbackQuery(/^dispute:(.+)$/, async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
       const userId = BigInt(ctx.from!.id);
 
@@ -303,11 +303,15 @@ export class BotUpdate implements OnModuleInit {
     // ─── Wallet ──────────────────────────────────────────────────────────────
 
     bot.callbackQuery('wallet:set', async (ctx) => {
-      await ctx.answerCallbackQuery();
+      await this.safeAnswerCallback(ctx);
+      ctx.session.step = 'awaiting_wallet';
+    
       await ctx.reply(
         `Please send your TON wallet address (starts with EQ or UQ):`,
+        {
+          reply_markup: new InlineKeyboard().text('🔙 Back', 'menu:wallet'),
+        },
       );
-      ctx.session.step = 'idle'; // handled in text handler below
     });
 
     // ─── Text messages ───────────────────────────────────────────────────────
@@ -316,10 +320,26 @@ export class BotUpdate implements OnModuleInit {
       const text = ctx.message.text;
       const { step } = ctx.session;
 
-      // Check if user is setting wallet address
-      if ((text.startsWith('EQ') || text.startsWith('UQ')) && text.length > 40) {
-        await this.users.updateWallet(BigInt(ctx.from!.id), text.trim());
-        await ctx.reply(`✅ Wallet saved: \`${text.trim()}\``, { parse_mode: 'Markdown' });
+      if (step === 'awaiting_wallet') {
+        if ((text.startsWith('EQ') || text.startsWith('UQ')) && text.trim().length > 40) {
+          await this.users.updateWallet(BigInt(ctx.from!.id), text.trim());
+          ctx.session.step = 'idle';
+      
+          await ctx.reply(
+            `✅ Wallet saved: \`${text.trim()}\``,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: new InlineKeyboard().text('🔙 Back to menu', 'menu:wallet'),
+            },
+          );
+        } else {
+          await ctx.reply(
+            '❌ Invalid wallet address. Please send a valid TON wallet address starting with EQ or UQ.',
+            {
+              reply_markup: new InlineKeyboard().text('🔙 Back', 'menu:wallet'),
+            },
+          );
+        }
         return;
       }
 
@@ -485,6 +505,16 @@ export class BotUpdate implements OnModuleInit {
     );
   }
 
+  private async safeAnswerCallback(ctx: BotContext) {
+    if (!ctx.callbackQuery) return;
+  
+    try {
+      await ctx.answerCallbackQuery();
+    } catch (err: any) {
+      this.logger.warn(`Failed to answer callback query: ${err?.message ?? err}`);
+    }
+  }
+
   private async handleDisputeEvidence(ctx: BotContext, text: string) {
     const dealId = ctx.session.activeDealId;
     if (!dealId) return;
@@ -499,7 +529,6 @@ export class BotUpdate implements OnModuleInit {
         `📋 Evidence received. Both sides have submitted — running AI arbitration now...`,
       );
 
-      // Give arbitration a moment to run (it was triggered by setImmediate)
       setTimeout(async () => {
         const d = await this.dispute.findByDealId(dealId);
         if (d?.verdictJson) {
