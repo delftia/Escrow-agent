@@ -7,11 +7,26 @@ export class BotService implements OnModuleInit {
   private readonly logger = new Logger(BotService.name);
   public bot: Bot<BotContext>;
 
+  private async registerCommands() {
+    await this.bot.api.setMyCommands([
+      { command: 'start', description: 'Open the main menu' },
+      { command: 'newdeal', description: 'Create a new deal' },
+      { command: 'deals', description: 'Show your deals' },
+      { command: 'wallet', description: 'Connect or view wallet' },
+      { command: 'help', description: 'How TrustDeal works' },
+      { command: 'cancel', description: 'Cancel current action' },
+    ]);
+  }
+
   onModuleInit() {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set');
 
     this.bot = new Bot<BotContext>(token);
+
+    this.registerCommands().catch((err) =>
+  this.logger.error('Failed to register bot commands', err),
+);
 
     this.bot.use(
       session({

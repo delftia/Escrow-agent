@@ -32,9 +32,8 @@ export class BotUpdate implements OnModuleInit {
   onModuleInit() {
     const { bot } = this.bot;
 
-    // ─── /start ─────────────────────────────────────────────────────────────
-
     bot.command('start', async (ctx) => {
+      await this.resetFlow(ctx);
       const userId = BigInt(ctx.from!.id);
       await this.users.upsert({
         id: userId,
@@ -42,7 +41,6 @@ export class BotUpdate implements OnModuleInit {
         firstName: ctx.from!.first_name,
       });
 
-      // Handle invite links: /start invite_TOKEN
       const payload = ctx.match as string;
       if (payload?.startsWith('invite_')) {
         const token = payload.replace('invite_', '');
@@ -60,6 +58,45 @@ export class BotUpdate implements OnModuleInit {
           `4️⃣ AI arbitrates any disputes automatically`,
         { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
       );
+    });
+
+    bot.command('newdeal', async (ctx) => {
+      await this.resetFlow(ctx);
+      ctx.session.step = 'awaiting_description';
+      ctx.session.draftDeal = {};
+    
+      await ctx.reply(
+        `📝 <b>Create a new deal</b>\n\nDescribe your deal in plain text.`,
+        { parse_mode: 'HTML' },
+      );
+    });
+    
+    bot.command('deals', async (ctx) => {
+      await this.resetFlow(ctx);
+      await this.showMyDeals(ctx);
+    });
+    
+    bot.command('wallet', async (ctx) => {
+      await this.resetFlow(ctx);
+      await this.showWallet(ctx);
+    });
+    
+    bot.command('help', async (ctx) => {
+      await this.resetFlow(ctx);
+      await ctx.reply(
+        `❓ <b>How TrustDeal works</b>\n\nUse the buttons or commands to create and manage deals.`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: this.bot.mainMenu(),
+        },
+      );
+    });
+    
+    bot.command('cancel', async (ctx) => {
+      await this.resetFlow(ctx);
+      await ctx.reply('Current action cancelled.', {
+        reply_markup: this.bot.mainMenu(),
+      });
     });
 
     // ─── Menu callbacks ──────────────────────────────────────────────────────
@@ -80,6 +117,7 @@ export class BotUpdate implements OnModuleInit {
 
     bot.callbackQuery('menu:my_deals', async (ctx) => {
       await this.safeAnswerCallback(ctx);
+      await this.resetFlow(ctx);
       await this.showMyDeals(ctx);
     });
 
@@ -109,6 +147,14 @@ export class BotUpdate implements OnModuleInit {
           `Smart contract escrow coming in V2._`,
         { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
       );
+    });
+
+    bot.callbackQuery('menu:home', async (ctx) => {
+      await this.safeAnswerCallback(ctx);
+      await this.resetFlow(ctx);
+      await ctx.reply('Use the menu to get started:', {
+        reply_markup: this.bot.mainMenu(),
+      });
     });
 
     // ─── Deal view ───────────────────────────────────────────────────────────
@@ -145,14 +191,19 @@ export class BotUpdate implements OnModuleInit {
       ctx.session.draftDeal = {};
 
       const botUsername = ctx.me.username;
-      const inviteLink = `https://t.me/${botUsername}?start=invite_${deal.inviteToken}`;
-
+      const inviteLink = this.buildInviteLink(botUsername, deal.inviteToken);
+      
       await ctx.reply(
-        `✅ *Deal created!*\n\n` +
+        `✅ <b>Deal created!</b>\n\n` +
           `Share this link with the person who will do the work:\n\n` +
-          `${inviteLink}\n\n` +
+          `<a href="${this.escapeHtml(inviteLink)}">${this.escapeHtml(inviteLink)}</a>\n\n` +
           `Once they accept, you'll be asked to lock the funds.`,
-        { parse_mode: 'Markdown' },
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard()
+            .text('📋 My Deals', 'menu:my_deals').row()
+            .text('🏠 Main menu', 'menu:home'),
+        },
       );
     });
 
@@ -219,16 +270,24 @@ export class BotUpdate implements OnModuleInit {
     bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
       await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
-
+    
       await ctx.reply(
         `⏳ *Checking payment...*\n\n` +
           `I'm monitoring the blockchain. You'll be notified once the transaction is confirmed.\n` +
           `This usually takes 10–30 seconds.`,
         { parse_mode: 'Markdown' },
       );
-
-      // Start polling queue
-      await this.queue.schedulePaymentVerification(dealId);
+    
+      void this.queue.schedulePaymentVerification(dealId).catch(async (err) => {
+        this.logger.error(`Failed to schedule payment verification for ${dealId}`, err);
+    
+        try {
+          await ctx.reply(
+            `❌ I couldn't start blockchain monitoring right now.\n\nPlease try again in a few seconds.`,
+            { reply_markup: this.bot.mainMenu() },
+          );
+        } catch {}
+      });
     });
 
     // ─── Submit result ───────────────────────────────────────────────────────
@@ -304,12 +363,15 @@ export class BotUpdate implements OnModuleInit {
 
     bot.callbackQuery('wallet:set', async (ctx) => {
       await this.safeAnswerCallback(ctx);
+      await this.resetFlow(ctx);
+    
       ctx.session.step = 'awaiting_wallet';
     
       await ctx.reply(
         `Please send your TON wallet address (starts with EQ or UQ):`,
         {
-          reply_markup: new InlineKeyboard().text('🔙 Back', 'menu:wallet'),
+          reply_markup: new InlineKeyboard()
+            .text('❌ Cancel', 'menu:home'),
         },
       );
     });
@@ -321,25 +383,40 @@ export class BotUpdate implements OnModuleInit {
       const { step } = ctx.session;
 
       if (step === 'awaiting_wallet') {
-        if ((text.startsWith('EQ') || text.startsWith('UQ')) && text.trim().length > 40) {
-          await this.users.updateWallet(BigInt(ctx.from!.id), text.trim());
+        const wallet = text.trim();
+      
+        if ((wallet.startsWith('EQ') || wallet.startsWith('UQ')) && wallet.length > 40) {
+          await this.users.updateWallet(BigInt(ctx.from!.id), wallet);
+      
+          const pendingWalletDealId = ctx.session.pendingWalletDealId;
           ctx.session.step = 'idle';
+          ctx.session.pendingWalletDealId = undefined;
       
           await ctx.reply(
-            `✅ Wallet saved: \`${text.trim()}\``,
+            `✅ <b>Wallet saved:</b>\n<code>${this.escapeHtml(wallet)}</code>`,
             {
-              parse_mode: 'Markdown',
-              reply_markup: new InlineKeyboard().text('🔙 Back to menu', 'menu:wallet'),
+              parse_mode: 'HTML',
+              reply_markup: new InlineKeyboard()
+                .text('🏠 Main menu', 'menu:home')
+                .row()
+                .text('👛 My wallet', 'menu:wallet'),
             },
           );
-        } else {
-          await ctx.reply(
-            '❌ Invalid wallet address. Please send a valid TON wallet address starting with EQ or UQ.',
-            {
-              reply_markup: new InlineKeyboard().text('🔙 Back', 'menu:wallet'),
-            },
-          );
+      
+          if (pendingWalletDealId) {
+            await this.handlePayment(ctx, pendingWalletDealId, BigInt(ctx.from!.id));
+          }
+      
+          return;
         }
+      
+        await ctx.reply(
+          `❌ Invalid wallet address.\n\nPlease send a valid TON wallet address starting with EQ or UQ.`,
+          {
+            reply_markup: new InlineKeyboard()
+              .text('❌ Cancel', 'menu:home'),
+          },
+        );
         return;
       }
 
@@ -475,11 +552,18 @@ export class BotUpdate implements OnModuleInit {
     const user = await this.users.findById(userId);
 
     if (!user?.walletAddress) {
+      ctx.session.step = 'awaiting_wallet';
+      ctx.session.pendingWalletDealId = dealId;
+    
       await ctx.reply(
-        `👛 *Wallet required*\n\n` +
+        `👛 <b>Wallet required</b>\n\n` +
           `To pay, I need your TON wallet address to send refunds if needed.\n\n` +
           `Please send your wallet address (starts with EQ or UQ):`,
-        { parse_mode: 'Markdown' },
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard()
+            .text('❌ Cancel', 'menu:home'),
+        },
       );
       return;
     }
@@ -515,6 +599,17 @@ export class BotUpdate implements OnModuleInit {
     }
   }
 
+  private escapeHtml(value: string) {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+  
+  private buildInviteLink(botUsername: string, inviteToken: string) {
+    return `https://t.me/${botUsername}?start=invite_${inviteToken}`;
+  }
+
   private async handleDisputeEvidence(ctx: BotContext, text: string) {
     const dealId = ctx.session.activeDealId;
     if (!dealId) return;
@@ -548,6 +643,13 @@ export class BotUpdate implements OnModuleInit {
     }
   }
 
+  private async resetFlow(ctx: BotContext) {
+    ctx.session.step = 'idle';
+    ctx.session.draftDeal = {};
+    ctx.session.activeDealId = undefined;
+    ctx.session.pendingWalletDealId = undefined;
+  }
+
   private async showMyDeals(ctx: BotContext) {
     const userId = BigInt(ctx.from!.id);
     const dealList = await this.deals.findByUser(userId);
@@ -570,7 +672,9 @@ export class BotUpdate implements OnModuleInit {
       keyboard.text(`${emoji} ${deal.id.slice(0, 8)}`, `view:${deal.id}`).row();
     }
 
-    keyboard.text('➕ New Deal', 'menu:new_deal');
+    keyboard
+    .text('➕ New Deal', 'menu:new_deal').row()
+    .text('🏠 Main menu', 'menu:home');
     await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
   }
 
@@ -583,23 +687,33 @@ export class BotUpdate implements OnModuleInit {
     const emoji = this.bot.statusEmoji(deal.status);
     const c = deal.contractJson as Record<string, any>;
 
-    let text =
-      `${emoji} *Deal \`${dealId.slice(0, 8)}\`*\n\n` +
-      `Status: *${deal.status}*\n` +
-      `Amount: *${deal.amountTon} TON*\n` +
-      `Your role: *${role}*\n`;
+const botUsername = ctx.me.username;
+const inviteLink = this.buildInviteLink(botUsername, deal.inviteToken);
 
-    if (deal.deadlineAt) {
-      text += `Deadline: *${new Date(deal.deadlineAt).toLocaleDateString()}*\n`;
-    }
-    if (c?.serviceType) {
-      text += `\nService: ${c.serviceType}`;
-    }
+let text =
+  `${emoji} <b>Deal <code>${this.escapeHtml(dealId.slice(0, 8))}</code></b>\n\n` +
+  `Status: <b>${this.escapeHtml(deal.status)}</b>\n` +
+  `Amount: <b>${deal.amountTon} TON</b>\n` +
+  `Your role: <b>${this.escapeHtml(role)}</b>\n`;
 
-    await ctx.reply(text, {
-      parse_mode: 'Markdown',
-      reply_markup: this.bot.dealActions(dealId, role, deal.status),
-    });
+if (deal.deadlineAt) {
+  text += `Deadline: <b>${this.escapeHtml(new Date(deal.deadlineAt).toLocaleDateString())}</b>\n`;
+}
+
+if (c?.serviceType) {
+  text += `\nService: ${this.escapeHtml(String(c.serviceType))}\n`;
+}
+
+if (role === 'creator') {
+  text +=
+    `\nInvite link:\n` +
+    `<a href="${this.escapeHtml(inviteLink)}">${this.escapeHtml(inviteLink)}</a>\n`;
+}
+
+await ctx.reply(text, {
+  parse_mode: 'HTML',
+  reply_markup: this.bot.dealActions(dealId, role, deal.status),
+});
   }
 
   private async showWallet(ctx: BotContext) {
@@ -607,12 +721,20 @@ export class BotUpdate implements OnModuleInit {
     const user = await this.users.findById(userId);
 
     if (!user?.walletAddress) {
+      ctx.session.step = 'awaiting_wallet';
+      ctx.session.pendingWalletDealId = undefined;
+    
       await ctx.reply(
-        `👛 *No wallet connected*\n\n` +
+        `👛 <b>No wallet connected</b>\n\n` +
           `Send your TON wallet address (starts with EQ or UQ) to connect it.\n\n` +
           `Your wallet is needed for refunds and payments.`,
-        { parse_mode: 'Markdown' },
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard()
+            .text('❌ Cancel', 'menu:home'),
+        },
       );
+      return;
     } else {
       await ctx.reply(
         `👛 *Your wallet*\n\n` +

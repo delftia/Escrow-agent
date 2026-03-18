@@ -1,33 +1,38 @@
-import { Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { PAYMENT_QUEUE } from './queue.constants';
 
+import { Injectable, Logger } from '@nestjs/common';
+
 @Injectable()
 export class QueueService {
+  private readonly logger = new Logger(QueueService.name);
+
   constructor(
     @InjectQueue(PAYMENT_QUEUE) private readonly paymentQueue: Queue,
   ) {}
 
-  /**
-   * Schedule payment verification polling.
-   * Retries every 15 seconds for up to 15 minutes.
-   * If user paid, it will be found within a few polls.
-   */
   async schedulePaymentVerification(dealId: string): Promise<void> {
-    await this.paymentQueue.add(
-      'verify-payment',
-      { dealId },
-      {
-        delay: 15_000,
-        attempts: 60,
-        backoff: {
-          type: 'fixed',
+    try {
+      await this.paymentQueue.add(
+        'verify-payment',
+        { dealId },
+        {
           delay: 15_000,
+          attempts: 60,
+          backoff: {
+            type: 'fixed',
+            delay: 15_000,
+          },
+          removeOnComplete: true,
+          removeOnFail: false,
         },
-        removeOnComplete: true,
-        removeOnFail: false,
-      },
-    );
+      );
+
+      this.logger.log(`Scheduled payment verification for deal ${dealId}`);
+    } catch (err) {
+      this.logger.error(`Failed to enqueue payment verification for deal ${dealId}`, err);
+      throw err;
+    }
   }
 }

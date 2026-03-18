@@ -11,13 +11,14 @@ export interface DraftDeal {
 
 export interface SessionData {
   step:
-  | 'idle'
-  | 'awaiting_description'
-  | 'awaiting_clarification'
-  | 'awaiting_dispute_evidence'
-  | 'awaiting_wallet';
+    | 'idle'
+    | 'awaiting_description'
+    | 'awaiting_clarification'
+    | 'awaiting_dispute_evidence'
+    | 'awaiting_wallet';
   draftDeal: DraftDeal;
   activeDealId?: string;
+  pendingWalletDealId?: string;
 }
 
 export type BotContext = Context & SessionFlavor<SessionData>;

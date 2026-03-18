@@ -21,9 +21,12 @@ import { NotificationModule } from './modules/notification/notification.module';
     ScheduleModule.forRoot(),
     BullModule.forRoot({
       redis: {
-        host: process.env.REDIS_HOST ?? 'localhost',
+        host: process.env.REDIS_HOST ?? '127.0.0.1',
         port: Number(process.env.REDIS_PORT ?? 6379),
         password: process.env.REDIS_PASSWORD || undefined,
+        maxRetriesPerRequest: 1,
+        connectTimeout: 5000,
+        enableReadyCheck: false,
       },
     }),
     DatabaseModule,
