@@ -31,7 +31,7 @@ export class NotificationService {
     await this.send(
       deal.creatorId,
       `🎯 *Executor accepted your deal!*\n\nDeal \`${dealId.slice(0, 8)}\` is ready.\nLock *${deal.amountTon} TON* in escrow to start the work.`,
-      new InlineKeyboard().text(`💎 Pay ${deal.amountTon} TON`, `pay:${dealId}`),
+      new InlineKeyboard().text(`💎 Lock funds`, `pay:${dealId}`)
     );
   }
 

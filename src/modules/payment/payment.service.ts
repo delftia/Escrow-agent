@@ -16,23 +16,43 @@ export class PaymentService {
    * STEP 1: Create a pending payment intent and return payment links.
    * Called when executor confirms the deal.
    */
-  async createPaymentIntent(dealId: string): Promise<{ tonLink: string; tonkeeperLink: string }> {
+  async createPaymentIntent(dealId: string): Promise<{
+    tonLink: string;
+    tonkeeperLink: string;
+    lockAmountTon: number;
+  }> {
     const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
     if (!deal) throw new Error('Deal not found');
-
-    // Create pending record in DB
+  
+    const feeBufferTon = 0.02;
+    const lockAmountTon = Number((deal.amountTon + feeBufferTon).toFixed(4));
+  
+    const existingPending = await this.prisma.paymentIntent.findFirst({
+      where: { dealId, type: PaymentType.LOCK, status: PaymentStatus.PENDING },
+      orderBy: { createdAt: 'desc' },
+    });
+  
+    if (existingPending) {
+      return {
+        tonLink: await this.ton.buildPaymentLink(dealId, existingPending.amountTon),
+        tonkeeperLink: await this.ton.buildTonkeeperLink(dealId, existingPending.amountTon),
+        lockAmountTon: existingPending.amountTon,
+      };
+    }
+  
     await this.prisma.paymentIntent.create({
       data: {
         dealId,
-        amountTon: deal.amountTon,
+        amountTon: lockAmountTon,
         type: PaymentType.LOCK,
         status: PaymentStatus.PENDING,
       },
     });
-
+  
     return {
-      tonLink: this.ton.buildPaymentLink(dealId, deal.amountTon),
-      tonkeeperLink: this.ton.buildTonkeeperLink(dealId, deal.amountTon),
+      tonLink: await this.ton.buildPaymentLink(dealId, lockAmountTon),
+      tonkeeperLink: await this.ton.buildTonkeeperLink(dealId, lockAmountTon),
+      lockAmountTon,
     };
   }
 
@@ -45,7 +65,14 @@ export class PaymentService {
     const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
     if (!deal) return false;
 
-    const txHash = await this.ton.findIncomingTx(dealId, deal.amountTon);
+    const pendingLock = await this.prisma.paymentIntent.findFirst({
+      where: { dealId, type: PaymentType.LOCK, status: PaymentStatus.PENDING },
+      orderBy: { createdAt: 'desc' },
+    });
+    
+    if (!pendingLock) return false;
+    
+    const txHash = await this.ton.findIncomingTx(dealId, pendingLock.amountTon);
     if (!txHash) return false;
 
     // Prevent double-confirmation

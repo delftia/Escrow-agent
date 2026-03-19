@@ -31,7 +31,10 @@
     "reflect-metadata": "^0.2.1",
     "rxjs": "^7.8.1",
     "uuid": "^9.0.1",
-    "dayjs": "^1.11.10"
+    "dayjs": "^1.11.10",
+    "@ton/core": "^0.62.0",
+    "@ton/crypto": "^3.3.0",
+    "@ton/ton": "^15.4.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.2",

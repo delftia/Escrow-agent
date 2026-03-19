@@ -1,115 +1,167 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import axios from 'axios';
+import { Address, beginCell, internal, toNano } from '@ton/core';
+import { mnemonicToPrivateKey } from '@ton/crypto';
+import { TonClient, WalletContractV5R1, SendMode } from '@ton/ton';
 
-/**
- * TonService wraps @ton/mcp running as HTTP server on port 3001.
- *
- * Start @ton/mcp before running the app:
- *   MNEMONIC="24 words" WALLET_VERSION=agentic AGENTIC_WALLET_ADDRESS=EQ... npx @ton/mcp@alpha --http 3001
- *
- * All private key operations happen inside @ton/mcp process.
- * This service only sends JSON-RPC calls to it.
- */
 @Injectable()
 export class TonService implements OnModuleInit {
   private readonly logger = new Logger(TonService.name);
-  private readonly mcpUrl = 'http://localhost:3001/mcp';
   private readonly network = process.env.TON_NETWORK ?? 'testnet';
 
-  private get toncenterBase() {
+  private get toncenterApiBase() {
     return this.network === 'mainnet'
       ? 'https://toncenter.com/api/v2'
       : 'https://testnet.toncenter.com/api/v2';
   }
 
+  private get toncenterRpcEndpoint() {
+    return this.network === 'mainnet'
+      ? 'https://toncenter.com/api/v2/jsonRPC'
+      : 'https://testnet.toncenter.com/api/v2/jsonRPC';
+  }
+
   async onModuleInit() {
-    // Verify @ton/mcp is reachable
     try {
-      await this.getEscrowBalance();
-      this.logger.log('@ton/mcp connected successfully');
-    } catch {
-      this.logger.warn(
-        '@ton/mcp not reachable. Make sure it is running on port 3001.\n' +
-          'Run: MNEMONIC="..." WALLET_VERSION=agentic npx @ton/mcp@alpha --http 3001',
+      const address = await this.getEscrowAddress();
+      this.logger.log(`Escrow wallet ready: ${address}`);
+    } catch (err: any) {
+      this.logger.error(
+        'Escrow wallet init failed',
+        err?.stack || err?.message || String(err),
       );
     }
   }
 
-  /**
-   * Send TON from escrow wallet to any address
-   */
-  async transfer(toAddress: string, amountTon: number, comment?: string): Promise<string> {
-    this.logger.log(`Transferring ${amountTon} TON → ${toAddress}`);
-
-    const res = await axios.post(this.mcpUrl, {
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'tools/call',
-      params: {
-        name: 'send_ton',
-        arguments: {
-          to: toAddress,
-          amount: String(amountTon),
-          comment: comment ?? '',
-        },
+  private async getWalletContext() {
+    const mnemonicRaw = process.env.MNEMONIC;
+    if (!mnemonicRaw) throw new Error('MNEMONIC is not set');
+  
+    const mnemonic = mnemonicRaw.trim().split(/\s+/);
+    const keyPair = await mnemonicToPrivateKey(mnemonic);
+  
+    const wallet = WalletContractV5R1.create({
+      workchain: 0,
+      publicKey: keyPair.publicKey,
+      walletId: {
+        networkGlobalId: this.network === 'mainnet' ? -239 : -3,
       },
     });
-
-    const result = res.data?.result;
-    if (result?.isError) {
-      throw new Error(`@ton/mcp transfer failed: ${JSON.stringify(result.content)}`);
-    }
-
-    const txHash: string = result?.content?.[0]?.text ?? 'unknown_hash';
-    this.logger.log(`Transfer done. TX: ${txHash}`);
-    return txHash;
-  }
-
-  /**
-   * Get current balance of the escrow agentic wallet
-   */
-  async getEscrowBalance(): Promise<number> {
-    const res = await axios.post(this.mcpUrl, {
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'tools/call',
-      params: { name: 'get_balance', arguments: {} },
+  
+    const client = new TonClient({
+      endpoint: this.toncenterRpcEndpoint,
+      apiKey: process.env.TONCENTER_API_KEY,
     });
-
-    const text: string = res.data?.result?.content?.[0]?.text ?? '0';
-    // text looks like "Balance: 12.5 TON" or just "12.5"
-    const match = text.match(/[\d.]+/);
-    return match ? parseFloat(match[0]) : 0;
+  
+    return {
+      client,
+      keyPair,
+      wallet,
+      openedWallet: client.open(wallet),
+      address: wallet.address,
+    };
   }
 
-  /**
-   * Poll TON blockchain for incoming transaction matching dealId comment and amount.
-   * Returns tx hash if found, null otherwise.
-   *
-   * How it works:
-   * 1. We query the last 20 transactions of our escrow wallet via Toncenter API
-   * 2. For each incoming tx we check:
-   *    - comment contains "trustdeal:<dealId>"
-   *    - amount is within 1% of expected (to handle rounding)
-   * 3. If match found → return tx hash
-   */
-  async findIncomingTx(dealId: string, expectedAmountTon: number): Promise<string | null> {
-    const walletAddress = process.env.AGENTIC_WALLET_ADDRESS;
-    if (!walletAddress) {
-      this.logger.error('AGENTIC_WALLET_ADDRESS not set');
-      return null;
+  async getEscrowAddress(): Promise<string> {
+    const { address } = await this.getWalletContext();
+    return address.toString();
+  }
+
+  async getEscrowBalance(): Promise<number> {
+    const { client, address } = await this.getWalletContext();
+    const balanceNano = await client.getBalance(address);
+    return Number(balanceNano) / 1e9;
+  }
+
+  async transfer(toAddress: string, amountTon: number, comment?: string): Promise<string> {
+    const { openedWallet, keyPair, client, address } = await this.getWalletContext();
+  
+    const balanceNano = await client.getBalance(address);
+    const amountNano = toNano(amountTon.toString());
+    const reserveNano = toNano('0.02');
+  
+    this.logger.log(`Escrow address: ${address.toString()}`);
+    this.logger.log(`Escrow balance before transfer: ${Number(balanceNano) / 1e9} TON`);
+    this.logger.log(`Transferring ${amountTon} TON → ${toAddress}`);
+  
+    if (balanceNano < amountNano + reserveNano) {
+      throw new Error(
+        `Insufficient escrow balance for payout. Balance=${Number(balanceNano) / 1e9} TON, required≈${amountTon + 0.02} TON`,
+      );
     }
+  
+    const seqnoBefore = await openedWallet.getSeqno();
+  
+    const body = comment
+      ? beginCell().storeUint(0, 32).storeStringTail(comment).endCell()
+      : undefined;
+  
+    let lastError: any;
+  
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await openedWallet.sendTransfer({
+          seqno: seqnoBefore,
+          secretKey: keyPair.secretKey,
+          sendMode: SendMode.PAY_GAS_SEPARATELY | SendMode.IGNORE_ERRORS,
+          messages: [
+            internal({
+              to: Address.parse(toAddress),
+              value: amountNano,
+              bounce: false,
+              body,
+            }),
+          ],
+        });
+  
+        for (let i = 0; i < 5; i++) {
+          await this.sleep(4000);
+          const seqnoNow = await openedWallet.getSeqno();
+          if (seqnoNow > seqnoBefore) {
+            const txRef = `seqno:${seqnoNow}`;
+            this.logger.log(`Transfer submitted successfully. Ref=${txRef}`);
+            return txRef;
+          }
+        }
+  
+        throw new Error('Transfer submitted but seqno did not advance in time');
+      } catch (err: any) {
+        lastError = err;
+  
+        const status = err?.status || err?.response?.status;
+        const message =
+          err?.response?.data
+            ? JSON.stringify(err.response.data)
+            : err?.stack || err?.message || String(err);
+  
+        this.logger.error(`Transfer attempt ${attempt} failed`, message);
+  
+        if (status === 429 && attempt < 3) {
+          await this.sleep(5000 * attempt);
+          continue;
+        }
+  
+        throw err;
+      }
+    }
+  
+    throw lastError;
+  }
+
+  async findIncomingTx(dealId: string, expectedAmountTon: number): Promise<string | null> {
+    const walletAddress = await this.getEscrowAddress();
 
     try {
       const params: Record<string, string> = {
         address: walletAddress,
         limit: '30',
       };
+
       if (process.env.TONCENTER_API_KEY) {
         params.api_key = process.env.TONCENTER_API_KEY;
       }
 
-      const res = await axios.get(`${this.toncenterBase}/getTransactions`, { params });
+      const res = await axios.get(`${this.toncenterApiBase}/getTransactions`, { params });
       const txs: any[] = res.data?.result ?? [];
 
       const expectedComment = `trustdeal:${dealId}`;
@@ -121,7 +173,8 @@ export class TonService implements OnModuleInit {
         const amountTon = Number(inMsg.value) / 1e9;
         const comment: string = inMsg.message ?? '';
 
-        const amountMatch = Math.abs(amountTon - expectedAmountTon) / expectedAmountTon < 0.02;
+        const amountMatch =
+          Math.abs(amountTon - expectedAmountTon) / expectedAmountTon < 0.02;
         const commentMatch = comment.includes(expectedComment);
 
         if (amountMatch && commentMatch) {
@@ -130,32 +183,32 @@ export class TonService implements OnModuleInit {
       }
 
       return null;
-    } catch (err) {
-      this.logger.error('Toncenter query error', err);
+    } catch (err: any) {
+      this.logger.error(
+        'Toncenter query error',
+        err?.response?.data
+          ? JSON.stringify(err.response.data)
+          : err?.stack || err?.message || String(err),
+      );
       return null;
     }
   }
 
-  /**
-   * Build a TON deeplink that opens Tonkeeper with pre-filled transfer.
-   * User just taps "Confirm" in their wallet.
-   *
-   * Format: ton://transfer/<address>?amount=<nanotons>&text=<comment>
-   */
-  buildPaymentLink(dealId: string, amountTon: number): string {
-    const wallet = process.env.AGENTIC_WALLET_ADDRESS;
+  async buildPaymentLink(dealId: string, amountTon: number): Promise<string> {
+    const wallet = await this.getEscrowAddress();
     const nanotons = Math.floor(amountTon * 1e9);
     const comment = encodeURIComponent(`trustdeal:${dealId}`);
     return `ton://transfer/${wallet}?amount=${nanotons}&text=${comment}`;
   }
 
-  /**
-   * Same link but for Tonkeeper web
-   */
-  buildTonkeeperLink(dealId: string, amountTon: number): string {
-    const wallet = process.env.AGENTIC_WALLET_ADDRESS;
+  async buildTonkeeperLink(dealId: string, amountTon: number): Promise<string> {
+    const wallet = await this.getEscrowAddress();
     const nanotons = Math.floor(amountTon * 1e9);
     const comment = encodeURIComponent(`trustdeal:${dealId}`);
     return `https://app.tonkeeper.com/transfer/${wallet}?amount=${nanotons}&text=${comment}`;
+  }
+
+  private sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

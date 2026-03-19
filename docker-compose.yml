@@ -19,24 +19,6 @@ services:
     ports:
       - '3000:3000'
 
-  # ─── @ton/mcp agentic wallet server ─────────────────────────────────────────
-  # This process holds the private key and signs all TON transactions.
-  # The main app communicates with it via HTTP on port 3001.
-  ton-mcp:
-    image: node:20-alpine
-    restart: unless-stopped
-    command: >
-      sh -c "npm install -g @ton/mcp@alpha 2>/dev/null;
-             npx @ton/mcp@alpha --http 3001"
-    ports:
-      - '3001:3001'
-    environment:
-      MNEMONIC: ${MNEMONIC}
-      WALLET_VERSION: ${WALLET_VERSION:-agentic}
-      AGENTIC_WALLET_ADDRESS: ${AGENTIC_WALLET_ADDRESS}
-      NETWORK: ${TON_NETWORK:-testnet}
-      TONCENTER_API_KEY: ${TONCENTER_API_KEY:-}
-
   # ─── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
@@ -58,7 +40,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-    - '6379:6379'
+    - '6380:6379'
     volumes:
       - redis_data:/data
     healthcheck:

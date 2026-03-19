@@ -28,6 +28,24 @@ export class DealService {
     });
   }
 
+  async assertCanComplete(dealId: string, creatorId: bigint) {
+    const deal = await this.findById(dealId);
+    if (!deal) throw new NotFoundException('Deal not found');
+    if (deal.creatorId !== creatorId) throw new ForbiddenException('Not your deal');
+    if (deal.status !== DealStatus.UNDER_REVIEW) {
+      throw new ForbiddenException('Deal is not under review');
+    }
+  
+    return deal;
+  }
+  
+  async markCompleted(dealId: string) {
+    return this.prisma.deal.update({
+      where: { id: dealId },
+      data: { status: DealStatus.COMPLETED, completedAt: new Date() },
+    });
+  }
+
   async findById(id: string) {
     return this.prisma.deal.findUnique({ where: { id } });
   }
@@ -72,18 +90,6 @@ export class DealService {
     return this.prisma.deal.update({
       where: { id: dealId },
       data: { status: DealStatus.UNDER_REVIEW },
-    });
-  }
-
-  async complete(dealId: string, creatorId: bigint) {
-    const deal = await this.findById(dealId);
-    if (!deal) throw new NotFoundException('Deal not found');
-    if (deal.creatorId !== creatorId) throw new ForbiddenException('Not your deal');
-    if (deal.status !== DealStatus.UNDER_REVIEW) throw new ForbiddenException('Deal is not under review');
-
-    return this.prisma.deal.update({
-      where: { id: dealId },
-      data: { status: DealStatus.COMPLETED, completedAt: new Date() },
     });
   }
 
