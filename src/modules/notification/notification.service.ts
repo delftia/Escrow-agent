@@ -62,6 +62,24 @@ export class NotificationService {
     );
   }
 
+  async onFundsLocked(dealId: string): Promise<void> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal?.executorId) return;
+  
+    const deadline = deal.deadlineAt
+      ? dayjs(deal.deadlineAt).format('DD MMM YYYY, HH:mm')
+      : 'Not set';
+  
+    await this.send(
+      deal.executorId,
+      `💎 *Funds locked in escrow!*\n\n` +
+        `Deal \`${dealId.slice(0, 8)}\` is now active.\n` +
+        `*${deal.amountTon} TON* secured.\n` +
+        `Deadline: *${deadline}*`,
+      new InlineKeyboard().text('📤 Submit Result', `submit:${dealId}`),
+    );
+  }
+
   async onDealCompleted(dealId: string, txHash: string): Promise<void> {
     const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
     if (!deal?.executorId) return;

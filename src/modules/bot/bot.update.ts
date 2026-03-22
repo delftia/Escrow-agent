@@ -11,6 +11,7 @@ import { DisputeService } from '../dispute/dispute.service';
 import { ArbitrationService } from '../arbitration/arbitration.service';
 import { NotificationService } from '../notification/notification.service';
 import { QueueService } from '../queue/queue.service';
+import { isDemoMode } from '../../common/app-mode';
 
 @Injectable()
 export class BotUpdate implements OnModuleInit {
@@ -270,23 +271,50 @@ export class BotUpdate implements OnModuleInit {
     bot.callbackQuery(/^paid:(.+)$/, async (ctx) => {
       await this.safeAnswerCallback(ctx);
       const dealId = ctx.match[1];
-
+    
+      if (isDemoMode()) {
+        await ctx.reply(
+          `⏳ *Simulating blockchain confirmation...*\n\n` +
+            `This takes a couple of seconds in demo mode.`,
+          { parse_mode: 'Markdown' },
+        );
+      
+        setTimeout(async () => {
+          try {
+            await this.payment.confirmDemoPayment(dealId);
+            await this.deals.markPaid(dealId);
+            await this.notifications.onFundsLocked(dealId);
+      
+            await ctx.reply(
+              `✅ *Payment confirmed!*\n\n` +
+                `Your funds are locked in escrow.\n` +
+                `This was simulated in demo mode.`,
+              { parse_mode: 'Markdown' },
+            );
+          } catch (err: any) {
+            await ctx.reply(`❌ ${err?.message ?? err}`);
+          }
+        }, 2000);
+      
+        return;
+      }
+    
       await ctx.reply(
         `⏳ *Checking payment...*\n\n` +
-        `I'm monitoring the blockchain. You'll be notified once the transaction is confirmed.\n` +
-        `This usually takes 10–30 seconds.`,
+          `I'm monitoring the blockchain. You'll be notified once the transaction is confirmed.\n` +
+          `This usually takes 10–30 seconds.`,
         { parse_mode: 'Markdown' },
       );
-
+    
       void this.queue.schedulePaymentVerification(dealId).catch(async (err) => {
         this.logger.error(`Failed to schedule payment verification for ${dealId}`, err);
-
+    
         try {
           await ctx.reply(
             `❌ I couldn't start blockchain monitoring right now.\n\nPlease try again in a few seconds.`,
             { reply_markup: this.bot.mainMenu() },
           );
-        } catch { }
+        } catch {}
       });
     });
 
@@ -320,18 +348,26 @@ export class BotUpdate implements OnModuleInit {
       try {
         await this.deals.assertCanComplete(dealId, userId);
 
-        const loadingMsg = await ctx.reply('💸 Releasing payment...');
-
-        const txHash = await this.payment.releaseToExecutor(dealId);
-
+        const loadingMsg = await ctx.reply(
+          isDemoMode() ? '💸 Simulating payout...' : '💸 Releasing payment...',
+        );
+        
+        const txHash = isDemoMode()
+          ? await this.payment.releaseToExecutorDemo(dealId)
+          : await this.payment.releaseToExecutor(dealId);
+        
         await this.deals.markCompleted(dealId);
         await this.notifications.onDealCompleted(dealId, txHash);
 
         await ctx.api.deleteMessage(ctx.chat!.id, loadingMsg.message_id).catch(() => { });
         await ctx.reply(
-          `🎉 *Deal completed!*\n\n` +
-          `Payment released to the executor.\n` +
-          `TX: \`${txHash.slice(0, 20)}...\``,
+          isDemoMode()
+            ? `🎉 *Deal completed!*\n\n` +
+              `Payment released to the executor.\n` +
+              `Demo ref: \`${txHash}\``
+            : `🎉 *Deal completed!*\n\n` +
+              `Payment released to the executor.\n` +
+              `TX: \`${txHash.slice(0, 20)}...\``,
           { parse_mode: 'Markdown', reply_markup: this.bot.mainMenu() },
         );
       } catch (err) {
@@ -585,13 +621,32 @@ export class BotUpdate implements OnModuleInit {
 
     const links = await this.payment.createPaymentIntent(dealId);
 
+    if (isDemoMode()) {
+      await ctx.reply(
+        `💎 *Demo payment required*\n\n` +
+          `Deal amount: *${deal.amountTon} TON*\n` +
+          `Escrow lock amount: *${links.lockAmountTon} TON*\n\n` +
+          `The extra amount covers network fees so funds can be safely released or refunded.\n\n` +
+          `TON escrow is configured and available in production mode.\n` +
+          `For hackathon demo, blockchain settlement is simulated so you can test the full flow instantly.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: new InlineKeyboard()
+            .url('Open in Tonkeeper', links.tonkeeperLink).row()
+            .url('Open in TON Wallet', links.tonLink).row()
+            .text('✅ Simulate payment', `paid:${dealId}`),
+        },
+      );
+      return;
+    }
+    
     await ctx.reply(
       `💎 *Payment required*\n\n` +
-      `Deal amount: *${deal.amountTon} TON*\n` +
-      `Escrow lock amount: *${links.lockAmountTon} TON*\n\n` +
-      `The extra amount covers network fees so funds can be safely released or refunded.\n\n` +
-      `Use one of the links below to open your wallet with pre-filled details.\n` +
-      `After sending, tap *"I paid"* and I'll confirm on the blockchain.`,
+        `Deal amount: *${deal.amountTon} TON*\n` +
+        `Escrow lock amount: *${links.lockAmountTon} TON*\n\n` +
+        `The extra amount covers network fees so funds can be safely released or refunded.\n\n` +
+        `Use one of the links below to open your wallet with pre-filled details.\n` +
+        `After sending, tap *"I paid"* and I'll confirm on the blockchain.`,
       {
         parse_mode: 'Markdown',
         reply_markup: new InlineKeyboard()

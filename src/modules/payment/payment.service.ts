@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service';
 import { TonService } from '../ton/ton.service';
 import { PaymentType, PaymentStatus } from '@prisma/client';
+import { isDemoMode } from '../../common/app-mode';
 
 @Injectable()
 export class PaymentService {
@@ -209,5 +210,69 @@ export class PaymentService {
       where: { dealId },
       orderBy: { createdAt: 'asc' },
     });
+  }
+
+
+  async confirmDemoPayment(dealId: string): Promise<string> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal) throw new Error('Deal not found');
+  
+    const existing = await this.prisma.paymentIntent.findFirst({
+      where: { dealId, type: PaymentType.LOCK, status: PaymentStatus.CONFIRMED },
+    });
+    if (existing?.txHash) return existing.txHash;
+  
+    const pendingLock = await this.prisma.paymentIntent.findFirst({
+      where: { dealId, type: PaymentType.LOCK, status: PaymentStatus.PENDING },
+      orderBy: { createdAt: 'desc' },
+    });
+  
+    const txHash = `demo_lock_${dealId}`;
+  
+    if (pendingLock) {
+      await this.prisma.paymentIntent.update({
+        where: { id: pendingLock.id },
+        data: {
+          txHash,
+          status: PaymentStatus.CONFIRMED,
+          confirmedAt: new Date(),
+        },
+      });
+    } else {
+      await this.prisma.paymentIntent.create({
+        data: {
+          dealId,
+          amountTon: deal.amountTon,
+          txHash,
+          type: PaymentType.LOCK,
+          status: PaymentStatus.CONFIRMED,
+          confirmedAt: new Date(),
+        },
+      });
+    }
+  
+    this.logger.log(`Demo payment confirmed for deal ${dealId}`);
+    return txHash;
+  }
+  
+  async releaseToExecutorDemo(dealId: string): Promise<string> {
+    const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });
+    if (!deal) throw new Error('Deal not found');
+  
+    const txHash = `demo_release_${dealId}`;
+  
+    await this.prisma.paymentIntent.create({
+      data: {
+        dealId,
+        amountTon: deal.amountTon,
+        txHash,
+        type: PaymentType.RELEASE,
+        status: PaymentStatus.CONFIRMED,
+        confirmedAt: new Date(),
+      },
+    });
+  
+    this.logger.log(`Demo release confirmed for deal ${dealId}`);
+    return txHash;
   }
 }

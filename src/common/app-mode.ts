@@ -1,0 +1,1 @@
+export const isDemoMode = () => (process.env.APP_MODE ?? 'demo') === 'demo';
