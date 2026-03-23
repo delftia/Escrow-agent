@@ -6,6 +6,13 @@
 
 ---
 
+## 🔗 Links
+
+🎥 Demo video: https://drive.google.com/file/d/1kjmI2JP1IgEASweMIe9s7F6BIHct_lpR/view  
+🤖 Try the bot: https://t.me/trust_deal_contest_bot  
+
+---
+
 ## 🧠 What makes it special
 
 TrustDeal is not just a bot — it's a **complete deal system**:
